@@ -2,7 +2,6 @@
 import json
 import sys
 import os
-from dotenv import load_dotenv
 import asyncio
 import logging
 import pyodbc
@@ -11,72 +10,72 @@ from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
 import re
 
-# Load environment variables
-load_dotenv()
-
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mssql_mcp_server")
+
+# Log all environment variables for debugging
+logger.info(f"Received env: {dict(os.environ)}")
 
 app = Server("mssql_mcp_server")
 
 class DBConfig:
     def __init__(self):
         self.config = {
-            "server": os.getenv("MSSQL_SERVER"),
-            "database": os.getenv("MSSQL_DATABASE"), 
-            "user": os.getenv("MSSQL_USER"),
-            "password": os.getenv("MSSQL_PASSWORD"),
-            "driver": os.getenv("MSSQL_DRIVER")
+            "server": os.environ.get("MSSQL_SERVER", "71.19.253.106"),
+            "database": os.environ.get("MSSQL_DATABASE", "WNGBAK"),
+            "user": os.environ.get("MSSQL_USER", "sa"),
+            "password": os.environ.get("MSSQL_PASSWORD", ""),
+            "driver": os.environ.get("MSSQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
         }
+        logger.info(f"Using database: {self.config['database']} on server: {self.config['server']}")
         self.connection = None
 
     def get_connection(self):
         try:
             if not self.connection:
+                server_info = self.config["server"].split(',')
+                server = server_info[0]
+                port = server_info[1] if len(server_info) > 1 else "1433"
+                
                 conn_str = (
                     f"DRIVER={self.config['driver']};"
-                    f"SERVER={self.config['server']};"
+                    f"SERVER={server},{port};"
                     f"DATABASE={self.config['database']};"
                     f"UID={self.config['user']};"
                     f"PWD={self.config['password']};"
                     "TrustServerCertificate=yes"
                 )
-                self.connection = pyodbc.connect(conn_str, readonly=True)  # เพิ่ม readonly=True
+                logger.info(f"Attempting to connect with: {conn_str.replace(self.config['password'], '***')}")
+                self.connection = pyodbc.connect(conn_str, readonly=True)
+                logger.info("Database connection successful")
             return self.connection
-        except:
+        except Exception as e:
+            logger.error(f"Database connection failed: {str(e)}")
             self.connection = None
             raise
 
 class SQLValidator:
     @staticmethod
     def is_read_only_query(query: str) -> bool:
-        # ทำความสะอาด query
         clean_query = query.strip().upper()
         
-        # รายการคำสั่งที่อนุญาต
-        allowed_statements = [
-            'SELECT', 'WITH', 'DECLARE'
-        ]
-        
-        # รายการคำสั่งที่ไม่อนุญาต
+        allowed_statements = ['SELECT', 'WITH', 'DECLARE']
         forbidden_statements = [
             'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 
             'ALTER', 'TRUNCATE', 'MERGE', 'UPSERT', 'REPLACE',
             'GRANT', 'REVOKE', 'EXEC', 'EXECUTE', 'SP_'
         ]
         
-        # ตรวจสอบว่าเริ่มต้นด้วยคำสั่งที่อนุญาตหรือไม่
         starts_with_allowed = any(clean_query.startswith(stmt) for stmt in allowed_statements)
         if not starts_with_allowed:
             return False
             
-        # ตรวจสอบว่ามีคำสั่งต้องห้ามหรือไม่
         contains_forbidden = any(stmt in clean_query for stmt in forbidden_statements)
         if contains_forbidden:
             return False
             
-        # ตรวจสอบเพิ่มเติมสำหรับ SQL Injection
-        has_dangerous_chars = re.search(r';\s*\w+', clean_query)  # ตรวจหา semicolon ที่ตามด้วยคำสั่ง
+        has_dangerous_chars = re.search(r';\s*\w+', clean_query)
         if has_dangerous_chars:
             return False
             
@@ -156,7 +155,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not query:
         raise ValueError("Query is required")
 
-    # ตรวจสอบว่าเป็น read-only query
     if not sql_validator.is_read_only_query(query):
         return [TextContent(type="text", text="Error: Only SELECT queries are allowed")]
 
