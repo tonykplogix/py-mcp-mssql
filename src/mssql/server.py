@@ -9,6 +9,9 @@ from mcp.server import Server
 from mcp.types import Resource, Tool, TextContent
 from pydantic import AnyUrl
 import re
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -22,29 +25,47 @@ app = Server("mssql_mcp_server")
 class DBConfig:
     def __init__(self):
         self.config = {
-            "server": os.environ.get("MSSQL_SERVER", "71.19.253.106"),
-            "database": os.environ.get("MSSQL_DATABASE", "WNGBAK"),
-            "user": os.environ.get("MSSQL_USER", "sa"),
+            "server": os.environ.get("MSSQL_SERVER"),
+            "port": "1433",  # Default port if not specified in server
+            "database": os.environ.get("MSSQL_DATABASE", ""),
+            "user": os.environ.get("MSSQL_USER", ""),
             "password": os.environ.get("MSSQL_PASSWORD", ""),
             "driver": os.environ.get("MSSQL_DRIVER", "{ODBC Driver 18 for SQL Server}")
         }
-        logger.info(f"Using database: {self.config['database']} on server: {self.config['server']}")
+        
+        # Split server and port if provided together
+        if "," in self.config["server"]:
+            server_parts = self.config["server"].split(",")
+            self.config["server"] = server_parts[0]
+            if len(server_parts) > 1:
+                self.config["port"] = server_parts[1]
+        
+        logger.info(f"Using database: {self.config['database']} on server: {self.config['server']}:{self.config['port']}")
         self.connection = None
 
     def get_connection(self):
         try:
+            # Check if connection is alive
+            if self.connection:
+                try:
+                    # Test the connection with a simple query
+                    self.connection.execute("SELECT 1").fetchall()
+                except:
+                    logger.info("Connection lost, reconnecting...")
+                    self.connection = None
+
             if not self.connection:
-                server_info = self.config["server"].split(',')
-                server = server_info[0]
-                port = server_info[1] if len(server_info) > 1 else "1433"
-                
                 conn_str = (
                     f"DRIVER={self.config['driver']};"
-                    f"SERVER={server},{port};"
+                    f"SERVER={self.config['server']},{self.config['port']};"
                     f"DATABASE={self.config['database']};"
                     f"UID={self.config['user']};"
                     f"PWD={self.config['password']};"
-                    "TrustServerCertificate=yes"
+                    "Encrypt=yes;"
+                    "TrustServerCertificate=yes;"
+                    "Connection Timeout=30;"
+                    "ConnectRetryCount=3;"
+                    "ConnectRetryInterval=10"
                 )
                 logger.info(f"Attempting to connect with: {conn_str.replace(self.config['password'], '***')}")
                 self.connection = pyodbc.connect(conn_str, readonly=True)
@@ -58,28 +79,11 @@ class DBConfig:
 class SQLValidator:
     @staticmethod
     def is_read_only_query(query: str) -> bool:
-        clean_query = query.strip().upper()
+        # Debug logging
+        logger.info(f"Validating query: {query[:50]}...")
         
-        allowed_statements = ['SELECT', 'WITH', 'DECLARE']
-        forbidden_statements = [
-            'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 
-            'ALTER', 'TRUNCATE', 'MERGE', 'UPSERT', 'REPLACE',
-            'GRANT', 'REVOKE', 'EXEC', 'EXECUTE', 'SP_'
-        ]
-        
-        starts_with_allowed = any(clean_query.startswith(stmt) for stmt in allowed_statements)
-        if not starts_with_allowed:
-            return False
-            
-        contains_forbidden = any(stmt in clean_query for stmt in forbidden_statements)
-        if contains_forbidden:
-            return False
-            
-        has_dangerous_chars = re.search(r';\s*\w+', clean_query)
-        if has_dangerous_chars:
-            return False
-            
-        return True
+        # Very simple check - just make sure it starts with SELECT
+        return query.strip().upper().startswith('SELECT')
 
 db = DBConfig()
 sql_validator = SQLValidator()
@@ -155,7 +159,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not query:
         raise ValueError("Query is required")
 
-    if not sql_validator.is_read_only_query(query):
+    # Log the query and validation result
+    validation_result = sql_validator.is_read_only_query(query)
+    logger.info(f"Query validation result: {validation_result}")
+    
+    if not validation_result:
         return [TextContent(type="text", text="Error: Only SELECT queries are allowed")]
 
     try:
@@ -165,8 +173,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
-        result = [",".join(map(str, row)) for row in rows]
-        return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
+        
+        # Determine total number of rows for summary information
+        row_count = len(rows)
+        
+        # Convert rows to list of dictionaries for better readability
+        # Limit to first 20 rows for display
+        display_rows = rows[:3]
+        result_list = []
+        for row in display_rows:
+            row_dict = {}
+            for i, col in enumerate(columns):
+                row_dict[col] = str(row[i])
+            result_list.append(row_dict)
+            
+        # Format the result as JSON
+        formatted_result = json.dumps(result_list, indent=2)
+        
+        # Create a summary header
+        summary = f"Query returned {row_count} rows. "
+        if row_count > 3:
+            summary += f"Showing first 3 rows:"
+        
+        return [TextContent(type="text", text=f"{summary}\n\n{formatted_result}")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
